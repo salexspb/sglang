@@ -25,7 +25,6 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
 )
-from sglang.srt.utils.common import Range
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cuda_ci,
@@ -74,9 +73,6 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         inflight_middle_chunks=0,
     )
     req.finished = lambda: req.finished_reason is not None
-    req.set_extend_range = lambda start, end: setattr(
-        req, "extend_range", Range(start, end)
-    )
     return req
 
 
@@ -242,7 +238,7 @@ class TestHiSparseUnit(unittest.TestCase):
         req.kv.kv_allocated_len = fill_len
         req.kv.kv_committed_len = fill_len
         req.full_untruncated_fill_ids = array("q", range(fill_len))
-        req.extend_range = Range(0, fill_len)
+        req.extend_end = fill_len
         return kv_loc
 
     # ==================================================================
@@ -977,7 +973,7 @@ class TestHiSparseUnit(unittest.TestCase):
         )
         self.assertEqual(req.kv.kv_allocated_len, fill_len)
         self.assertEqual(req.kv.kv_committed_len, fill_len)
-        self.assertEqual(req.extend_range.length, fill_len)
+        self.assertEqual(req.extend_end - req.prefix_len, fill_len)
 
         rounded_len = (fill_len + self.page_size - 1) // self.page_size * self.page_size
         self.assertEqual(
