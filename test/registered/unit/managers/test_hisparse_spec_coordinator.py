@@ -90,6 +90,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             is_dsv4_hisparse=False,
             top_k=1024,
             device_buffer_size=4096,
+            page_size=64,
         )
         spec_swap = HiSparseSpecSwapManager(coordinator, num_draft_tokens=2)
 
