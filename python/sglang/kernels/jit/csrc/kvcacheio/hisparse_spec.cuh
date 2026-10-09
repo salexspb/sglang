@@ -25,7 +25,9 @@ using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int64_t HASH_DELETED = -2;
-constexpr int32_t COMPACT_HASH_BITS = 13;
+// Scratch hash positions are < NUM_STEPS * NUM_TOP_K <= MAX_SPEC_OCCURRENCES.
+constexpr int64_t MAX_SPEC_OCCURRENCES = 16384;
+constexpr int32_t COMPACT_HASH_BITS = 14;
 constexpr int32_t COMPACT_HASH_MASK = (1 << COMPACT_HASH_BITS) - 1;
 constexpr int32_t COMPACT_APPROX_CLAIM_FLAG = int32_t{1} << 29;
 constexpr int32_t COMPACT_APPROX_ADMIT_FLAG = int32_t{1} << 30;
@@ -363,7 +365,9 @@ __device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* 
 
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
-  return __ffsll(mask) - 1;
+  // uint64_t is unsigned long on Linux; HIP overloads __ffsll only for the
+  // long long types, so the uncast call is ambiguous.
+  return __ffsll(static_cast<unsigned long long>(mask)) - 1;
 #else
   return __ffs(mask) - 1;
 #endif
@@ -959,7 +963,10 @@ void load_cache_to_device_buffer_spec(
 
   static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
-  static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
+  static_assert(
+      NUM_STEPS * NUM_TOP_K <= MAX_SPEC_OCCURRENCES, "HiSparse speculative swap supports at most 16384 occurrences.");
+  static_assert(
+      (int64_t{1} << COMPACT_HASH_BITS) >= MAX_SPEC_OCCURRENCES, "compact hash positions must address every occurrence.");
 
   const int64_t bs = top_k_tokens.shape()[0];
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;

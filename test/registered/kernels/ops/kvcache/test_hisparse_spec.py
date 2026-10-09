@@ -279,6 +279,65 @@ class TestHiSparseSpec(CustomTestCase):
         _assert_output_matches_tokens(state, out, top_k_tokens)
         self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), 782)
 
+    def test_kpool_tail_width_beyond_8192_occurrences(self) -> None:
+        # A k-pool indexer (GLM-5.3-Flash: index_topk 2048, index_kpool 4)
+        # appends up to 3 tail tokens, so each step has 2051 columns and four
+        # steps hold 8204 occurrences. Tail columns may be -1 padding.
+        hot_size, page_size = 4096, 256
+        num_steps, top_k, item_words = 4, 2051, 72
+        total_occurrences = num_steps * top_k
+        seq_len = 32768
+        state = _make_state(
+            num_reqs=1,
+            hot_buffer_size=hot_size,
+            page_size=page_size,
+            scratch_size=4352,
+            seq_len=seq_len,
+            item_words=item_words,
+            metadata_occurrences=total_occurrences,
+        )
+
+        steps = []
+        next_miss = hot_size
+        unique_misses = 0
+        for step_idx, miss_count in enumerate((900, 700, 500, 300)):
+            hits = torch.roll(
+                torch.arange(hot_size, dtype=torch.int32, device=DEVICE),
+                step_idx * 131,
+            )[: 2048 - miss_count]
+            misses = torch.arange(
+                next_miss, next_miss + miss_count, dtype=torch.int32, device=DEVICE
+            )
+            next_miss += miss_count
+            unique_misses += miss_count
+            # Tail: step 0 has two tail tokens and one -1 pad, later steps three.
+            tail_start = seq_len - 8 + step_idx
+            tail = torch.arange(
+                tail_start, tail_start + 3, dtype=torch.int32, device=DEVICE
+            )
+            if step_idx == 0:
+                tail[-1] = -1
+            steps.append(torch.cat((hits, misses, tail)))
+        top_k_tokens = torch.stack(steps).unsqueeze(0).contiguous()
+        seq_lens = torch.full((num_steps,), seq_len, dtype=torch.int32, device=DEVICE)
+        out = _run_swap(top_k_tokens=top_k_tokens, seq_lens=seq_lens, state=state)
+        torch.cuda.synchronize()
+
+        valid = top_k_tokens >= 0
+        self.assertTrue(torch.all(out[~valid] == -1).item())
+        actual = state.device_buffer[out[valid].to(torch.long)]
+        expected = top_k_tokens[valid].to(torch.int64).unsqueeze(
+            -1
+        ) * TOKEN_SCALE + torch.arange(item_words, dtype=torch.int64, device=DEVICE)
+        torch.testing.assert_close(actual, expected)
+        tail_set = set(
+            int(t) for t in top_k_tokens[0, :, 2048:].flatten().tolist() if t >= 0
+        )
+        self.assertEqual(
+            int(state.swap_state.scratch_state[0, 0].item()),
+            unique_misses + len(tail_set),
+        )
+
     def test_records_union_plan_for_shared_layer_io(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k, item_words = 4, 2048, 72

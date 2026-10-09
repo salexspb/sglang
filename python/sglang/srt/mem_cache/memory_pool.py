@@ -4129,6 +4129,9 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        # Extra constructor kwargs for the full-attention pool, e.g. the
+        # HiSparse DSA pool's host_to_device_ratio.
+        full_kv_pool_kwargs: Optional[dict] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -4200,6 +4203,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                **(full_kv_pool_kwargs or {}),
             )
         else:
             MLAPoolClass = (
@@ -4279,6 +4283,52 @@ class HybridLinearKVPool(KVCache):
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
+
+    # HiSparse: the full-attention pool is a HiSparseDSATokenToKVPool. Its
+    # logical-to-device slot mapping is shared by all its layers, so these
+    # calls need no layer translation. Per-layer HiSparse state (host pool,
+    # swap-in buffers) is dense over the full-attention layers; callers map
+    # model layer ids with hisparse_layer_index().
+    @property
+    def is_hisparse(self) -> bool:
+        from sglang.srt.mem_cache.hisparse_memory_pool import (
+            HiSparseDSATokenToKVPool,
+        )
+
+        return isinstance(self.full_kv_pool, HiSparseDSATokenToKVPool)
+
+    def hisparse_layer_index(self, layer_id: int) -> int:
+        return self._transfer_full_attention_id(layer_id)
+
+    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
+        self.full_kv_pool.register_mapping(full_to_hisparse_device_index_mapping)
+
+    @property
+    def full_to_hisparse_device_index_mapping(self) -> torch.Tensor:
+        return self.full_kv_pool.full_to_hisparse_device_index_mapping
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_to_hisparse_device(indices)
+
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool._translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_hisparse_device(
+        self, full_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_hisparse_device(
+            full_indices
+        )
+
+    def translate_loc_from_full_to_compressed(
+        self, full_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_compressed(full_indices)
+
+    def transfer_values_on_device(
+        self, dst_indices: torch.Tensor, src_indices: torch.Tensor
+    ) -> None:
+        self.full_kv_pool.transfer_values_on_device(dst_indices, src_indices)
 
     def get_kv_buffer_shape(self) -> Tuple[torch.Size, torch.Size]:
         # Hybrid layer ids are global model-layer ids, while the backing pool

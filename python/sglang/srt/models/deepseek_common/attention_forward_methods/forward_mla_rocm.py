@@ -401,7 +401,9 @@ def _fused_rope_cat_and_cache(
         else kv_cache_dtype
     )
     kv_pool = get_token_to_kv_pool()
-    if isinstance(kv_pool, HiSparseDSATokenToKVPool):
+    if isinstance(kv_pool, HiSparseDSATokenToKVPool) or getattr(
+        kv_pool, "is_hisparse", False
+    ):
         # The fused write bypasses set_mla_kv_buffer()'s logical-to-device mapping.
         out_cache_loc = kv_pool.translate_loc_to_hisparse_device(out_cache_loc)
     # AITER reads slot_mapping with stride 1, including on the resident path.

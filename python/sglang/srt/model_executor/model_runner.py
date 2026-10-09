@@ -976,6 +976,17 @@ class ModelRunner:
         hisparse_top_k = getattr(
             self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
         )
+        # A k-pool indexer (index_kpool > 1) appends up to index_kpool - 1
+        # tail tokens (the newest partial group) after the index_topk
+        # selected tokens, and attention reads all of them. Swap them all in.
+        from sglang.srt.configs.model_config import get_dsa_index_kpool
+
+        index_kpool = max(
+            get_dsa_index_kpool(self.model_config.hf_config),
+            get_dsa_index_kpool(self.model_config.hf_text_config),
+        )
+        if index_kpool > 1:
+            hisparse_top_k += index_kpool - 1
         self.hisparse_coordinator = HiSparseCoordinator(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

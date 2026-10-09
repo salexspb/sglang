@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import weakref
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -144,6 +145,8 @@ class HiSparseSpecSwapManager:
 
     HASH_MULTIPLIER = 2654435761
     MIN_SCRATCH_CAPACITY = 1024
+    # Matches MAX_SPEC_OCCURRENCES in kvcacheio/hisparse_spec.cuh.
+    MAX_OCCURRENCES = 16384
     NUM_METADATA_VALUES_PER_OCCURRENCE = 5
     NUM_COUNTERS_PER_REQUEST = 4
 
@@ -168,6 +171,9 @@ class HiSparseSpecSwapManager:
         )
         self.states: tuple[HiSparseSpecState, ...] = ()
         self.top_k_device_locs: Optional[torch.Tensor] = None
+        # Debug only: log host-miss counts (forces a device sync per verify).
+        self._debug_stats = os.environ.get("SGLANG_DEBUG_HISPARSE_SPEC_STATS") == "1"
+        self._debug_counts = [0, 0, 0]
         if not self.enabled:
             return
 
@@ -180,8 +186,11 @@ class HiSparseSpecSwapManager:
                 "HiSparse spec swap requires 2-4 draft tokens and top_k >= 1024."
             )
         workspace_capacity = num_draft_tokens * coordinator.top_k
-        if workspace_capacity > 8192:
-            raise ValueError("HiSparse spec swap supports at most 8192 occurrences.")
+        if workspace_capacity > self.MAX_OCCURRENCES:
+            raise ValueError(
+                "HiSparse spec swap supports at most "
+                f"{self.MAX_OCCURRENCES} occurrences, got {workspace_capacity}."
+            )
         if max_num_req_slots > coordinator.device_buffer_size:
             raise ValueError(
                 "HiSparse spec request capacity must not exceed device_buffer_size."
@@ -194,6 +203,10 @@ class HiSparseSpecSwapManager:
                 workspace_capacity - coordinator.device_buffer_size,
             ),
         )
+        # Scratch slots come from the paged device allocator. A top_k that is
+        # not a page multiple (a k-pool indexer's tail) needs rounding up.
+        page_size = coordinator.page_size
+        self.scratch_capacity = -(-self.scratch_capacity // page_size) * page_size
         hash_size = 1 << max(1, (2 * coordinator.device_buffer_size - 1).bit_length())
         self._cache_index = torch.full(
             (layer_num, max_num_req_slots, 2, hash_size),
@@ -410,6 +423,8 @@ class HiSparseSpecSwapManager:
         """Persist accepted target-verify KV in host and the persistent buffer."""
         if batch.forward_mode.is_idle():
             return
+        if getattr(self, "_debug_stats", False):
+            self._log_debug_stats(batch)
         coordinator = self._coordinator
         req_pool_indices = batch.req_pool_indices[:, None]
         verify_cache_locs = batch.out_cache_loc
@@ -484,6 +499,23 @@ class HiSparseSpecSwapManager:
         )
         for req in batch.reqs:
             coordinator._skip_first_backup[req.kv.req_pool_idx] = True
+
+    def _log_debug_stats(self, batch: ScheduleBatch) -> None:
+        # The swap kernel leaves each request's unique host-miss count of its
+        # last call (the model's last DSA layer) in scratch_state[0, rid].
+        misses = int(self._scratch_state[0, batch.req_pool_indices].sum().item())
+        self._debug_counts[0] += 1
+        self._debug_counts[1] += misses
+        self._debug_counts[2] += batch.req_pool_indices.numel()
+        if self._debug_counts[0] % 100 == 0:
+            logger.info(
+                "HiSparse spec stats: %d verify batches, %d request-steps, "
+                "%d unique host misses on the last DSA layer (%.1f per step)",
+                self._debug_counts[0],
+                self._debug_counts[2],
+                self._debug_counts[1],
+                self._debug_counts[1] / max(self._debug_counts[2], 1),
+            )
 
     def swap_in(
         self,
@@ -562,6 +594,8 @@ class HiSparseCoordinator:
                 "copy."
             )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
+        # Model layer id -> HiSparse dense layer index (hybrid pools only).
+        self._hybrid_layer_index = None
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         self.is_dsv4_hisparse = isinstance(
@@ -606,6 +640,20 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
+                if getattr(kvcache, "is_hisparse", False):
+                    # Hybrid linear-attention model (e.g. GLM-5.3-Flash): the
+                    # HiSparse DSA pool is the wrapper's dense full-attention
+                    # pool. Per-layer HiSparse state is indexed by that pool's
+                    # dense layer index, not by the model layer id.
+                    self._hybrid_layer_index = kvcache.hisparse_layer_index
+                    full_layer_ids = sorted(kvcache.full_attention_layer_id_mapping)
+                    if shared_index_layers is not None and all(
+                        0 <= i < len(shared_index_layers) for i in full_layer_ids
+                    ):
+                        shared_index_layers = [
+                            shared_index_layers[i] for i in full_layer_ids
+                        ]
+                    kvcache = kvcache.full_kv_pool
                 self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     device_pool=self.mem_pool_device,
@@ -1571,6 +1619,8 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self._hybrid_layer_index is not None:
+            layer_id = self._hybrid_layer_index(layer_id)
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,
