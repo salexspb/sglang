@@ -541,6 +541,11 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        if self.model_runner.enable_hisparse:
+            # HiSparse keeps a request's full KV in the host-backed logical
+            # pool; the device pool holds only per-request swap buffers. Bound
+            # request length by the logical pool, as decode admission does.
+            kv_capacity = max(kv_capacity, self.model_runner.max_token_pool_size)
         max_req_len = min(
             self.model_config.context_len - 1,
             kv_capacity - 1,
