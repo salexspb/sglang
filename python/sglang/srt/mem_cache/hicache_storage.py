@@ -397,15 +397,18 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_size = storage_config.attn_cp_size
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
-        self.config_suffix = f"_{model_name}"
-        if not is_mla_model:
-            self.config_suffix += f"_{tp_rank}_{tp_size}"
-        if enable_pp:
-            self.config_suffix += f"_{pp_size}_{pp_rank}"
+        shard_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
         # Under NSA context parallel each CP rank holds a disjoint slice of every
         # page, so give each rank its own file key to avoid a cross-rank write race.
         if attn_cp_size > 1:
-            self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+            shard_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
+        # MLA KV is replicated across TP ranks, so its files carry no TP rank.
+        # Mamba (e.g. KDA) state is TP-sharded and every rank writes it (see
+        # HybridCacheController.should_backup), so it always keys by TP rank.
+        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"
+        self.config_suffix = (
+            f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
+        )
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -453,6 +456,8 @@ class HiCacheFile(HiCacheStorage):
         )
 
     def _get_suffixed_key(self, key: str) -> str:
+        if key.endswith(f".{PoolName.MAMBA.value}"):
+            return key + self.tp_config_suffix
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
@@ -470,7 +475,7 @@ class HiCacheFile(HiCacheStorage):
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if stem.endswith(self.config_suffix):
+            if stem.endswith((self.config_suffix, self.tp_config_suffix)):
                 self.metadata_cache.add(stem)
 
     def get(
